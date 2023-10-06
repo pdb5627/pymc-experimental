@@ -55,6 +55,7 @@ class ModelBuilder:
         self,
         model_config: Dict = None,
         sampler_config: Dict = None,
+        fit_method: str = "mcmc",
     ):
         """
         Initializes model configuration and sampler configuration for the model
@@ -67,6 +68,8 @@ class ModelBuilder:
             dictionary of parameters that initialise model configuration. Class-default defined by the user default_model_config method.
         sampler_config : Dictionary, optional
             dictionary of parameters that initialise sampler configuration. Class-default defined by the user default_sampler_config method.
+        fit_method : str
+            Which method to use to infer model parameters. One of ["mcmc", "MAP"].
         Examples
         --------
         >>> class MyModel(ModelBuilder):
@@ -80,6 +83,7 @@ class ModelBuilder:
         model_config = self.get_default_model_config() if model_config is None else model_config
 
         self.model_config = model_config  # parameters for priors etc.
+        self.fit_method = fit_method
         self.model = None  # Set by build_model
         self.idata: Optional[az.InferenceData] = None  # idata is generated during fitting
         self.is_fitted_ = False
@@ -456,7 +460,7 @@ class ModelBuilder:
         self,
         X: pd.DataFrame,
         y: Optional[pd.Series] = None,
-        fit_method="mcmc",
+        fit_method=None,
         progressbar: bool = True,
         predictor_names: List[str] = None,
         random_seed: RandomState = None,
@@ -475,6 +479,7 @@ class ModelBuilder:
             The target values (real numbers).
         fit_method : str
             Which method to use to infer model parameters. One of ["mcmc", "MAP"].
+            When set here, overrides the object attribute value.
         progressbar : bool
             Specifies whether the fit progressbar should be displayed
         predictor_names: List[str] = None,
@@ -486,6 +491,8 @@ class ModelBuilder:
             Parameters to pass to the inference method. See `_fit_mcmc` or `_fit_MAP` for
             method-specific parameters.
         """
+        if fit_method is None:
+            fit_method = self.fit_method
         available_methods = ["mcmc", "MAP"]
         if fit_method not in available_methods:
             raise ValueError(
@@ -716,6 +723,7 @@ class ModelBuilder:
         return {
             "model_config": self.model_config,
             "sampler_config": self.sampler_config,
+            "fit_method": self.fit_method,
         }
 
     def set_params(self, **params):
@@ -724,6 +732,7 @@ class ModelBuilder:
         """
         self.model_config = params["model_config"]
         self.sampler_config = params["sampler_config"]
+        self.fit_method = params["fit_method"]
 
     @property
     @abstractmethod

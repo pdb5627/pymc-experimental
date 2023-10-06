@@ -8,9 +8,15 @@ from pymc_experimental.model_builder import ModelBuilder
 
 
 class LinearModel(ModelBuilder):
-    def __init__(self, model_config: Dict = None, sampler_config: Dict = None, nsamples=100):
+    def __init__(
+        self,
+        model_config: Dict = None,
+        sampler_config: Dict = None,
+        fit_method: str = "mcmc",
+        nsamples: int = 100,
+    ):
         self.nsamples = nsamples
-        super().__init__(model_config, sampler_config)
+        super().__init__(model_config, sampler_config, fit_method)
 
     """
     This class is an implementation of a single-input linear regression model in PYMC using the
