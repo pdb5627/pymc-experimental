@@ -199,3 +199,50 @@ def test_pipeline_integration(toy_X, toy_y):
 
     X_pred = pd.DataFrame({"input": np.random.uniform(low=0, high=1, size=100)})
     model.predict(X_pred)
+
+
+@pytest.mark.slow
+def test_multiple_inputs():
+    np.random.seed(271)
+
+    # Generate data to which to fit the model
+    var_names = ["input0", "input1"]
+    slope = xr.DataArray([0.5, -0.25], dims=["input_var"], coords={"input_var": var_names})
+    X_fit = xr.DataArray(
+        np.random.uniform(0, 1, size=(100, 2)),
+        dims=["observation", "input_var"],
+        coords={"input_var": var_names},
+    )
+    X_pred = xr.DataArray(
+        np.random.uniform(0, 1, size=(10, 2)),
+        dims=["observation", "input_var"],
+        coords={"input_var": var_names},
+    )
+    obs_error = xr.DataArray(
+        np.random.normal(0, 0.1, size=len(X_fit["observation"])), dims="observation"
+    )
+    y_fit = slope @ X_fit + obs_error
+    y_pred_true = slope @ X_pred
+
+    # Create model
+    model_config = {
+        "intercept": None,
+        "slope": {"loc": 0, "scale": 10},
+        "obs_error": 2,
+    }
+    sampler_config = {
+        "draws": 1_000,
+        "tune": 1_000,
+        "chains": 3,
+        "target_accept": 0.95,
+    }
+    model = LinearModel(model_config=model_config, sampler_config=sampler_config)
+    model.fit(X_fit.to_pandas(), y_fit, random_seed=5237)
+
+    # Make predictions
+    y_pred = model.predict(X_pred.to_pandas())
+
+    # Check predictions against data-generating model
+    fit_slope = model.idata.posterior.slope.mean(dim=["chain", "draw"])
+    np.testing.assert_allclose(fit_slope, slope, rtol=0.15)
+    np.testing.assert_allclose(y_pred, y_pred_true, atol=0.05, rtol=0.15)

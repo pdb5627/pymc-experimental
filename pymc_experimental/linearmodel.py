@@ -13,12 +13,29 @@ class LinearModel(ModelBuilder):
         super().__init__(model_config, sampler_config)
 
     """
-    This class is an implementation of a single-input linear regression model in PYMC using the
-    BayesianEstimator base class for interoperability with scikit-learn.
+    This class is an implementation of a linear regression model in PYMC.
+
+    The regression model is as follows:
+
+    y = a X + b + ε
+
+    The parameters to be estimated are the slope a, the intercept b, and
+    the observation error ε.
+
+    The slope $a$ is a vector of length matching the number of columns of X.
+    The prior for the slope is a normal distribution with a given location and scale.
+
+    The intercept b is an optional scalar value. The prior for the intercept is
+    a normal distribution with a given location and scale. If the prior for the
+    intercept is set to `None` instead, then the value of the intercept is fixed at 0
+    (i.e. the intercept is not included in the model).
+
+    The observation error ε is a scalar value. The prior for the observation error is
+    a normal distribution with a given location and scale.
     """
 
     _model_type = "LinearModel"
-    version = "0.1"
+    version = "0.2"
 
     @staticmethod
     def get_default_model_config():
@@ -67,27 +84,37 @@ class LinearModel(ModelBuilder):
         """
         cfg = self.model_config
 
+        n_input_vars = X.shape[1]
+
         # Data array size can change but number of dimensions must stay the same.
         with pm.Model() as self.model:
-            x = pm.MutableData("x", np.zeros((1,)), dims="observation")
+            x = pm.MutableData("x", np.zeros((1, 1)), dims=["observation", "input_var"])
             y_data = pm.MutableData("y_data", np.zeros((1,)), dims="observation")
 
             # priors
-            intercept = pm.Normal(
-                "intercept", cfg["intercept"]["loc"], sigma=cfg["intercept"]["scale"]
+            if cfg["intercept"] is None:
+                intercept = 0
+            else:
+                intercept = pm.Normal(
+                    "intercept", cfg["intercept"]["loc"], sigma=cfg["intercept"]["scale"]
+                )
+            slope = pm.Normal(
+                "slope",
+                cfg["slope"]["loc"],
+                sigma=cfg["slope"]["scale"],
+                dims="input_var",
+                shape=n_input_vars,
             )
-            slope = pm.Normal("slope", cfg["slope"]["loc"], sigma=cfg["slope"]["scale"])
             obs_error = pm.HalfNormal("σ_model_fmc", cfg["obs_error"])
 
             # Model
-            y_model = pm.Deterministic("y_model", intercept + slope * x, dims="observation")
+            y_model = pm.Deterministic("y_model", intercept + slope @ x.T, dims="observation")
 
             # observed data
             y_hat = pm.Normal(
                 "y_hat",
                 y_model,
                 sigma=obs_error,
-                shape=x.shape,
                 observed=y_data,
                 dims="observation",
             )
@@ -96,7 +123,7 @@ class LinearModel(ModelBuilder):
 
     def _data_setter(self, X: pd.DataFrame, y: Optional[Union[pd.DataFrame, pd.Series]] = None):
         with self.model:
-            pm.set_data({"x": X.squeeze()})
+            pm.set_data({"x": X})
             if y is not None:
                 pm.set_data({"y_data": y.squeeze()})
 
