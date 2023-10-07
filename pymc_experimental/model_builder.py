@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import xarray as xr
+from pymc.backends import NDArray
+from pymc.backends.base import MultiTrace
 from pymc.util import RandomState
 
 # If scikit-learn is available, use its data validator
@@ -53,6 +55,7 @@ class ModelBuilder:
         self,
         model_config: Dict = None,
         sampler_config: Dict = None,
+        fit_method: str = "mcmc",
     ):
         """
         Initializes model configuration and sampler configuration for the model
@@ -65,6 +68,8 @@ class ModelBuilder:
             dictionary of parameters that initialise model configuration. Class-default defined by the user default_model_config method.
         sampler_config : Dictionary, optional
             dictionary of parameters that initialise sampler configuration. Class-default defined by the user default_sampler_config method.
+        fit_method : str
+            Which method to use to infer model parameters. One of ["mcmc", "MAP"].
         Examples
         --------
         >>> class MyModel(ModelBuilder):
@@ -78,6 +83,7 @@ class ModelBuilder:
         model_config = self.get_default_model_config() if model_config is None else model_config
 
         self.model_config = model_config  # parameters for priors etc.
+        self.fit_method = fit_method
         self.model = None  # Set by build_model
         self.idata: Optional[az.InferenceData] = None  # idata is generated during fitting
         self.is_fitted_ = False
@@ -454,6 +460,7 @@ class ModelBuilder:
         self,
         X: pd.DataFrame,
         y: Optional[pd.Series] = None,
+        fit_method=None,
         progressbar: bool = True,
         predictor_names: List[str] = None,
         random_seed: RandomState = None,
@@ -470,6 +477,9 @@ class ModelBuilder:
             The training input samples.
         y : array-like if sklearn is available, otherwise array, shape (n_obs,)
             The target values (real numbers).
+        fit_method : str
+            Which method to use to infer model parameters. One of ["mcmc", "MAP"].
+            When set here, overrides the object attribute value.
         progressbar : bool
             Specifies whether the fit progressbar should be displayed
         predictor_names: List[str] = None,
@@ -478,19 +488,16 @@ class ModelBuilder:
         random_seed : RandomState
             Provides sampler with initial random seed for obtaining reproducible samples
         **kwargs : Any
-            Custom sampler settings can be provided in form of keyword arguments.
-
-        Returns
-        -------
-        self : az.InferenceData
-            returns inference data of the fitted model.
-        Examples
-        --------
-        >>> model = MyModel()
-        >>> idata = model.fit(data)
-        Auto-assigning NUTS sampler...
-        Initializing NUTS using jitter+adapt_diag...
+            Parameters to pass to the inference method. See `_fit_mcmc` or `_fit_MAP` for
+            method-specific parameters.
         """
+        if fit_method is None:
+            fit_method = self.fit_method
+        available_methods = ["mcmc", "MAP"]
+        if fit_method not in available_methods:
+            raise ValueError(
+                f"Inference method {fit_method} not found. Choose one of {available_methods}."
+            )
         if predictor_names is None:
             predictor_names = []
         if y is None:
@@ -503,7 +510,11 @@ class ModelBuilder:
         sampler_config["progressbar"] = progressbar
         sampler_config["random_seed"] = random_seed
         sampler_config.update(**kwargs)
-        self.idata = self.sample_model(**sampler_config)
+
+        if fit_method == "mcmc":
+            self.idata = self.sample_model(**sampler_config)
+        elif fit_method == "MAP":
+            self.idata = self._fit_MAP(**sampler_config)
 
         X_df = pd.DataFrame(X, columns=X.columns)
         combined_data = pd.concat([X_df, y], axis=1)
@@ -517,6 +528,62 @@ class ModelBuilder:
             self.idata.add_groups(fit_data=combined_data.to_xarray())  # type: ignore
 
         return self.idata  # type: ignore
+
+    def _fit_MAP(
+        self,
+        **kwargs,
+    ):
+        """Find model maximum a posteriori using scipy optimizer"""
+
+        model = self.model
+        find_MAP_args = {**self.sampler_config, **kwargs}
+        if "random_seed" in find_MAP_args:
+            # find_MAP takes a different argument name for seed than sample_* do.
+            find_MAP_args["seed"] = find_MAP_args["random_seed"]
+        # Extra unknown arguments cause problems for SciPy minimize
+        allowed_args = [  # find_MAP args
+            "start",
+            "vars",
+            "method",
+            # "return_raw",  # probably causes a problem if set spuriously
+            # "include_transformed",  # probably causes a problem if set spuriously
+            "progressbar",
+            "maxeval",
+            "seed",
+        ]
+        allowed_args += [  # scipy.optimize.minimize args
+            # "fun",  # used by find_MAP
+            # "x0",  # used by find_MAP
+            "args",
+            "method",
+            # "jac",  # used by find_MAP
+            # "hess",  # probably causes a problem if set spuriously
+            # "hessp", # probably causes a problem if set spuriously
+            "bounds",
+            "constraints",
+            "tol",
+            "callback",
+            "options",
+        ]
+        for arg in list(find_MAP_args):
+            if arg not in allowed_args:
+                del find_MAP_args[arg]
+
+        map_res = pm.find_MAP(model=model, **find_MAP_args)
+        # Filter non-value variables
+        value_vars_names = {v.name for v in model.value_vars}
+        map_res = {k: v for k, v in map_res.items() if k in value_vars_names}
+
+        # Convert map result to InferenceData
+        map_strace = NDArray(model=model)
+        map_strace.setup(draws=1, chain=0)
+        map_strace.record(map_res)
+        map_strace.close()
+        trace = MultiTrace([map_strace])
+        idata = pm.to_inference_data(trace, model=model)
+        self.set_idata_attrs(idata)
+
+        return idata
 
     def predict(
         self,
@@ -655,6 +722,7 @@ class ModelBuilder:
         return {
             "model_config": self.model_config,
             "sampler_config": self.sampler_config,
+            "fit_method": self.fit_method,
         }
 
     def set_params(self, **params):
@@ -663,6 +731,7 @@ class ModelBuilder:
         """
         self.model_config = params["model_config"]
         self.sampler_config = params["sampler_config"]
+        self.fit_method = params["fit_method"]
 
     @property
     @abstractmethod

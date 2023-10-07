@@ -17,6 +17,7 @@ import json
 import sys
 import tempfile
 from typing import Dict, Union
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
@@ -41,8 +42,8 @@ def toy_y(toy_X):
     return y
 
 
-@pytest.fixture(scope="module")
-def fitted_model_instance(toy_X, toy_y):
+@pytest.fixture(scope="module", params=["mcmc", "MAP"])
+def fitted_model_instance(request, toy_X, toy_y):
     sampler_config = {
         "draws": 100,
         "tune": 100,
@@ -57,14 +58,18 @@ def fitted_model_instance(toy_X, toy_y):
     model = test_ModelBuilder(
         model_config=model_config, sampler_config=sampler_config, test_parameter="test_paramter"
     )
-    model.fit(toy_X)
+    model.fit(toy_X, toy_y, fit_method=request.param)
     return model
 
 
 class test_ModelBuilder(ModelBuilder):
-    def __init__(self, model_config=None, sampler_config=None, test_parameter=None):
+    def __init__(
+        self, model_config=None, sampler_config=None, test_parameter=None, fit_method="mcmc"
+    ):
         self.test_parameter = test_parameter
-        super().__init__(model_config=model_config, sampler_config=sampler_config)
+        super().__init__(
+            model_config=model_config, sampler_config=sampler_config, fit_method=fit_method
+        )
 
     _model_type = "test_model"
     version = "0.1"
@@ -185,17 +190,58 @@ def test_fit(fitted_model_instance):
     post_pred[fitted_model_instance.output_var].shape[0] == prediction_data.input.shape
 
 
-def test_fit_no_y(toy_X):
+@pytest.mark.parametrize("fit_method", ["mcmc", "MAP"])
+def test_fit_no_y(toy_X, fit_method):
     model_builder = test_ModelBuilder()
-    model_builder.idata = model_builder.fit(X=toy_X, chains=1, tune=1, draws=1)
+    model_builder.idata = model_builder.fit(
+        X=toy_X, chains=1, tune=1, draws=1, fit_method=fit_method
+    )
     assert model_builder.model is not None
     assert model_builder.idata is not None
     assert "posterior" in model_builder.idata.groups()
 
 
+@pytest.mark.parametrize("fit_method1", ["mcmc", "MAP"])
+@pytest.mark.parametrize("fit_method2", [None, "mcmc", "MAP"])
+def test_fit_method_in_init(toy_X, toy_y, fit_method1, fit_method2):
+    """Verify that fit_method can be passed in init and that fit_method passed to fit() overrides it."""
+    model_builder = test_ModelBuilder(fit_method=fit_method1)
+    model_builder.sample_model = Mock(wraps=model_builder.sample_model)
+    model_builder._fit_MAP = Mock(wraps=model_builder._fit_MAP)
+    f_mcmc = model_builder.sample_model
+    f_MAP = model_builder._fit_MAP
+    model_builder.fit(toy_X, toy_y, chains=1, tune=1, draws=1, fit_method=fit_method2)
+    if fit_method2 is None:
+        if fit_method1 == "mcmc":
+            f_mcmc.assert_called_once()
+            f_MAP.assert_not_called()
+        elif fit_method1 == "MAP":
+            f_mcmc.assert_not_called()
+            f_MAP.assert_called_once()
+    elif fit_method2 == "mcmc":
+        f_mcmc.assert_called_once()
+        f_MAP.assert_not_called()
+    elif fit_method2 == "MAP":
+        f_mcmc.assert_not_called()
+        f_MAP.assert_called_once()
+
+
 @pytest.mark.skipif(
     sys.platform == "win32", reason="Permissions for temp files not granted on windows CI."
 )
+def test_save_load(fitted_model_instance):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as temp:
+        fitted_model_instance.save(temp.name)
+        test_builder2 = test_ModelBuilder.load(temp.name)
+    assert sorted(fitted_model_instance.idata.groups()) == sorted(test_builder2.idata.groups())
+
+    x_pred = np.random.uniform(low=0, high=1, size=100)
+    prediction_data = pd.DataFrame({"input": x_pred})
+    pred1 = fitted_model_instance.predict(prediction_data["input"])
+    pred2 = test_builder2.predict(prediction_data["input"])
+    assert pred1.shape == pred2.shape
+
+
 def test_predict(fitted_model_instance):
     x_pred = np.random.uniform(low=0, high=1, size=100)
     prediction_data = pd.DataFrame({"input": x_pred})
@@ -213,8 +259,8 @@ def test_sample_posterior_predictive(fitted_model_instance, combined):
     pred = fitted_model_instance.sample_posterior_predictive(
         prediction_data["input"], combined=combined, extend_idata=True
     )
-    chains = fitted_model_instance.idata.sample_stats.dims["chain"]
-    draws = fitted_model_instance.idata.sample_stats.dims["draw"]
+    chains = fitted_model_instance.idata.posterior.dims["chain"]
+    draws = fitted_model_instance.idata.posterior.dims["draw"]
     expected_shape = (n_pred, chains * draws) if combined else (chains, draws, n_pred)
     assert pred[fitted_model_instance.output_var].shape == expected_shape
     assert np.issubdtype(pred[fitted_model_instance.output_var].dtype, np.floating)
