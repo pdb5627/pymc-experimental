@@ -17,6 +17,7 @@ import json
 import sys
 import tempfile
 from typing import Dict, Union
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
@@ -62,9 +63,13 @@ def fitted_model_instance(request, toy_X, toy_y):
 
 
 class test_ModelBuilder(ModelBuilder):
-    def __init__(self, model_config=None, sampler_config=None, test_parameter=None):
+    def __init__(
+        self, model_config=None, sampler_config=None, test_parameter=None, fit_method="mcmc"
+    ):
         self.test_parameter = test_parameter
-        super().__init__(model_config=model_config, sampler_config=sampler_config)
+        super().__init__(
+            model_config=model_config, sampler_config=sampler_config, fit_method=fit_method
+        )
 
     _model_type = "test_model"
     version = "0.1"
@@ -188,10 +193,37 @@ def test_fit(fitted_model_instance):
 @pytest.mark.parametrize("fit_method", ["mcmc", "MAP"])
 def test_fit_no_y(toy_X, fit_method):
     model_builder = test_ModelBuilder()
-    model_builder.idata = model_builder.fit(X=toy_X, chains=1, tune=1, draws=1, fit_method=fit_method)
+    model_builder.idata = model_builder.fit(
+        X=toy_X, chains=1, tune=1, draws=1, fit_method=fit_method
+    )
     assert model_builder.model is not None
     assert model_builder.idata is not None
     assert "posterior" in model_builder.idata.groups()
+
+
+@pytest.mark.parametrize("fit_method1", ["mcmc", "MAP"])
+@pytest.mark.parametrize("fit_method2", [None, "mcmc", "MAP"])
+def test_fit_method_in_init(toy_X, toy_y, fit_method1, fit_method2):
+    """Verify that fit_method can be passed in init and that fit_method passed to fit() overrides it."""
+    model_builder = test_ModelBuilder(fit_method=fit_method1)
+    model_builder.sample_model = Mock(wraps=model_builder.sample_model)
+    model_builder._fit_MAP = Mock(wraps=model_builder._fit_MAP)
+    f_mcmc = model_builder.sample_model
+    f_MAP = model_builder._fit_MAP
+    model_builder.fit(toy_X, toy_y, chains=1, tune=1, draws=1, fit_method=fit_method2)
+    if fit_method2 is None:
+        if fit_method1 == "mcmc":
+            f_mcmc.assert_called_once()
+            f_MAP.assert_not_called()
+        elif fit_method1 == "MAP":
+            f_mcmc.assert_not_called()
+            f_MAP.assert_called_once()
+    elif fit_method2 == "mcmc":
+        f_mcmc.assert_called_once()
+        f_MAP.assert_not_called()
+    elif fit_method2 == "MAP":
+        f_mcmc.assert_not_called()
+        f_MAP.assert_called_once()
 
 
 @pytest.mark.skipif(
