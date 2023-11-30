@@ -502,9 +502,9 @@ class ModelBuilder:
             predictor_names = []
         if y is None:
             y = np.zeros(X.shape[0])
-        y = pd.DataFrame({self.output_var: y})
-        self._generate_and_preprocess_model_data(X, y.values.flatten())
-        self.build_model(self.X, self.y)
+            y = pd.Series(y, name=self.output_var)
+        self._generate_and_preprocess_model_data(X, y)
+        self.build_model(X, y)
 
         sampler_config = self.sampler_config.copy()
         sampler_config["progressbar"] = progressbar
@@ -629,7 +629,7 @@ class ModelBuilder:
         posterior_means = posterior_predictive_samples[self.output_var].mean(
             dim=["chain", "draw"], keep_attrs=True
         )
-        return posterior_means.data
+        return posterior_means.to_pandas()
 
     def sample_prior_predictive(
         self,
@@ -705,13 +705,11 @@ class ModelBuilder:
         self._data_setter(X_pred)
 
         with self.model:  # sample with new input data
-            post_pred = pm.sample_posterior_predictive(self.idata, **kwargs)
+            post_pred = pm.sample_posterior_predictive(self.idata, predictions=True, **kwargs)
             if extend_idata:
                 self.idata.extend(post_pred)
 
-        posterior_predictive_samples = az.extract(
-            post_pred, "posterior_predictive", combined=combined
-        )
+        posterior_predictive_samples = az.extract(post_pred, "predictions", combined=combined)
 
         return posterior_predictive_samples
 
@@ -782,7 +780,7 @@ class ModelBuilder:
             Posterior predictive samples for each input X_pred
         """
 
-        X_pred = self._validate_data(X_pred)
+        # X_pred = self._validate_data(X_pred)
         posterior_predictive_samples = self.sample_posterior_predictive(
             X_pred, extend_idata, combined, **kwargs
         )

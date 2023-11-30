@@ -129,9 +129,11 @@ class LinearModel(ModelBuilder):
 
     def _data_setter(self, X: pd.DataFrame, y: Optional[Union[pd.DataFrame, pd.Series]] = None):
         with self.model:
-            pm.set_data({"x": X})
+            pm.set_data({"x": X}, coords={"observation": X.index})
             if y is not None:
-                pm.set_data({"y_data": y.squeeze()})
+                pm.set_data({"y_data": y.squeeze()}, coords={"observation": y.index})
+            else:
+                pm.set_data({"y_data": np.full(len(X), np.nan)}, coords={"observation": X.index})
 
     def _generate_and_preprocess_model_data(
         self, X: Union[pd.DataFrame, pd.Series], y: pd.Series
@@ -160,4 +162,6 @@ class LinearModel(ModelBuilder):
         >>> assert x.shape == (100, 1)
         >>> assert y.shape == (100,)
         """
+        # Ensure output Series is named appropriately
+        y = y.rename(self.output_var)
         self.X, self.y = X, y

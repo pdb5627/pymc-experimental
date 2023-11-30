@@ -58,7 +58,7 @@ def toy_y(toy_X, toy_actual_params):
     y = toy_actual_params["slope"] * toy_X["input"] + toy_actual_params["intercept"]
     np.random.seed(427)
     y = y + np.random.normal(0, toy_actual_params["obs_error"], size=len(toy_X))
-    y = pd.Series(y, name="output")
+    y = pd.Series(y, name="y_hat")
     return y
 
 
