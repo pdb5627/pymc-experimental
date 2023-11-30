@@ -106,7 +106,7 @@ def test_fit(fitted_linear_model_instance):
 
     pred = model.predict(new_X_pred)
     assert len(new_X_pred) == len(pred)
-    assert isinstance(pred, np.ndarray)
+    assert isinstance(pred, pd.Series)
     post_pred = model.predict_posterior(new_X_pred)
     assert len(new_X_pred) == len(post_pred)
     assert isinstance(post_pred, xr.DataArray)
