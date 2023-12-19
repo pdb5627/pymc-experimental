@@ -305,8 +305,6 @@ class ModelBuilder:
         with self.model:
             sampler_args = {**self.sampler_config, **kwargs}
             idata = pm.sample(**sampler_args)
-            idata.extend(pm.sample_prior_predictive())
-            idata.extend(pm.sample_posterior_predictive(idata))
 
         idata = self.set_idata_attrs(idata)
         return idata
