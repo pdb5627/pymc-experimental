@@ -1,21 +1,25 @@
 API Reference
 ***************
 
+Model
+=====
+
 This reference provides detailed documentation for all modules, classes, and
 methods in the current release of PyMC experimental.
 
-.. currentmodule:: pymc_experimental
+.. currentmodule:: pymc_extras
 .. autosummary::
    :toctree: generated/
 
    as_model
-   MarginalModel
+   marginalize
+   recover_marginals
    model_builder.ModelBuilder
 
 Inference
 =========
 
-.. currentmodule:: pymc_experimental.inference
+.. currentmodule:: pymc_extras.inference
 .. autosummary::
    :toctree: generated/
 
@@ -25,7 +29,7 @@ Inference
 Distributions
 =============
 
-.. currentmodule:: pymc_experimental.distributions
+.. currentmodule:: pymc_extras.distributions
 .. autosummary::
    :toctree: generated/
 
@@ -43,17 +47,18 @@ Distributions
 Utils
 =====
 
-.. currentmodule:: pymc_experimental.utils
+.. currentmodule:: pymc_extras.utils
 .. autosummary::
    :toctree: generated/
 
    spline.bspline_interpolation
    prior.prior_from_idata
+   model_equivalence.equivalent_models
 
 
 Statespace Models
 =================
-.. automodule:: pymc_experimental.statespace
+.. automodule:: pymc_extras.statespace
 .. toctree::
    :maxdepth: 1
 
@@ -64,9 +69,18 @@ Statespace Models
 
 Model Transforms
 ================
-.. automodule:: pymc_experimental.model.transforms
+.. automodule:: pymc_extras.model.transforms
 .. autosummary::
    :toctree: generated/
 
    autoreparam.vip_reparametrize
    autoreparam.VIP
+
+
+Printing
+========
+.. currentmodule:: pymc_extras.printing
+.. autosummary::
+   :toctree: generated/
+
+   model_table

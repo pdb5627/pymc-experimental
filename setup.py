@@ -13,26 +13,27 @@
 #   limitations under the License.
 
 import itertools
+import os
+
 from codecs import open
 from os.path import dirname, join, realpath
 
 from setuptools import find_packages, setup
 
-DISTNAME = "pymc-experimental"
+DISTNAME = "pymc-extras"
 DESCRIPTION = "A home for new additions to PyMC, which may include unusual probability distribitions, advanced model fitting algorithms, or any code that may be inappropriate to include in the pymc repository, but may want to be made available to users."
 AUTHOR = "PyMC Developers"
 AUTHOR_EMAIL = "pymc.devs@gmail.com"
-URL = "http://github.com/pymc-devs/pymc-experimental"
-LICENSE = "Apache License, Version 2.0"
+URL = "http://github.com/pymc-devs/pymc-extras"
+LICENSE = "Apache-2.0"
 
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: Apache Software License",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
@@ -64,21 +65,17 @@ extras_require = dict(
 extras_require["complete"] = sorted(set(itertools.chain.from_iterable(extras_require.values())))
 extras_require["dev"] = dev_install_reqs
 
-import os
-
-from setuptools import find_packages, setup
-
 
 def read_version():
     here = os.path.abspath(os.path.dirname(__file__))
-    with open(os.path.join(here, "pymc_experimental", "version.txt")) as f:
+    with open(os.path.join(here, "pymc_extras", "version.txt")) as f:
         version = f.read().strip()
     return version
 
 
 if __name__ == "__main__":
     setup(
-        name="pymc-experimental",
+        name="pymc-extras",
         version=read_version(),
         maintainer=AUTHOR,
         maintainer_email=AUTHOR_EMAIL,
@@ -93,7 +90,7 @@ if __name__ == "__main__":
         # package_data={'docs': ['*']},
         include_package_data=True,
         classifiers=classifiers,
-        python_requires=">=3.8",
+        python_requires=">=3.10",
         install_requires=install_reqs,
         extras_require=extras_require,
     )
