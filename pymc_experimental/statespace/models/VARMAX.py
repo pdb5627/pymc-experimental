@@ -1,8 +1,9 @@
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Sequence, Tuple
 
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
+from pytensor.tensor.slinalg import solve_discrete_lyapunov
 
 from pymc_experimental.statespace.core.statespace import PyMCStateSpace
 from pymc_experimental.statespace.models.utilities import make_default_coords
@@ -16,7 +17,6 @@ from pymc_experimental.statespace.utils.constants import (
     SHOCK_AUX_DIM,
     SHOCK_DIM,
 )
-from pymc_experimental.statespace.utils.pytensor_scipy import solve_discrete_lyapunov
 
 floatX = pytensor.config.floatX
 
@@ -31,7 +31,7 @@ class BayesianVARMAX(PyMCStateSpace):
         Number of autoregressive (AR) and moving average (MA) terms to include in the model. All terms up to the
         specified order are included. For restricted models, set zeros directly on the priors.
 
-    endog_names: List of str, optional
+    endog_names: list of str, optional
         Names of the endogenous variables being modeled. Used to generate names for the state and shock coords. If
         None, the state names will simply be numbered.
 
@@ -141,14 +141,13 @@ class BayesianVARMAX(PyMCStateSpace):
     def __init__(
         self,
         order: Tuple[int, int],
-        endog_names: List[str] = None,
+        endog_names: list[str] = None,
         k_endog: int = None,
         stationary_initialization: bool = False,
         filter_type: str = "standard",
         measurement_error: bool = False,
         verbose=True,
     ):
-
         if (endog_names is None) and (k_endog is None):
             raise ValueError("Must specify either endog_names or k_endog")
         if (endog_names is not None) and (k_endog is None):
@@ -201,7 +200,7 @@ class BayesianVARMAX(PyMCStateSpace):
         return names
 
     @property
-    def param_info(self) -> Dict[str, Dict[str, Any]]:
+    def param_info(self) -> dict[str, dict[str, Any]]:
         info = {
             "x0": {
                 "shape": (self.k_states,),
@@ -259,7 +258,7 @@ class BayesianVARMAX(PyMCStateSpace):
         raise NotImplementedError
 
     @property
-    def coords(self) -> Dict[str, Sequence]:
+    def coords(self) -> dict[str, Sequence]:
         coords = make_default_coords(self)
         if self.p > 0:
             coords.update({AR_PARAM_DIM: list(range(1, self.p + 1))})

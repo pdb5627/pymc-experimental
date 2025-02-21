@@ -1,5 +1,3 @@
-from typing import List
-
 import numpy as np
 import pandas as pd
 import pytensor
@@ -21,8 +19,15 @@ floatX = pytensor.config.floatX
 
 
 def load_nile_test_data():
+    from importlib.metadata import version
+
     nile = pd.read_csv("pymc_experimental/tests/statespace/test_data/nile.csv", dtype={"x": floatX})
-    nile.index = pd.date_range(start="1871-01-01", end="1970-01-01", freq="AS-Jan")
+    major, minor, rev = map(int, version("pandas").split("."))
+    if major >= 2 and minor >= 2 and rev >= 0:
+        freq_str = "YS-JAN"
+    else:
+        freq_str = "AS-JAN"
+    nile.index = pd.date_range(start="1871-01-01", end="1970-01-01", freq=freq_str)
     nile.rename(columns={"x": "height"}, inplace=True)
     nile = (nile - nile.mean()) / nile.std()
     nile = nile.astype(floatX)
@@ -170,7 +175,7 @@ def fast_eval(var):
     return pytensor.function([], var, mode="FAST_COMPILE")()
 
 
-def delete_rvs_from_model(rv_names: List[str]) -> None:
+def delete_rvs_from_model(rv_names: list[str]) -> None:
     """Remove all model mappings referring to rv
 
     This can be used to "delete" an RV from a model
@@ -207,19 +212,28 @@ def unpack_statespace(ssm):
     return [ssm[SHORT_NAME_TO_LONG[x]] for x in MATRIX_NAMES]
 
 
-def unpack_symbolic_matrices_with_params(mod, param_dict):
+def unpack_symbolic_matrices_with_params(mod, param_dict, data_dict=None, mode="FAST_COMPILE"):
+    inputs = list(mod._name_to_variable.values())
+    if data_dict is not None:
+        inputs += list(mod._name_to_data.values())
+    else:
+        data_dict = {}
+
     f_matrices = pytensor.function(
-        list(mod._name_to_variable.values()), unpack_statespace(mod.ssm), on_unused_input="ignore"
+        inputs,
+        unpack_statespace(mod.ssm),
+        on_unused_input="raise",
+        mode=mode,
     )
-    x0, P0, c, d, T, Z, R, H, Q = f_matrices(**param_dict)
+    x0, P0, c, d, T, Z, R, H, Q = f_matrices(**param_dict, **data_dict)
     return x0, P0, c, d, T, Z, R, H, Q
 
 
-def simulate_from_numpy_model(mod, rng, param_dict, steps=100):
+def simulate_from_numpy_model(mod, rng, param_dict, data_dict=None, steps=100):
     """
     Helper function to visualize the components outside of a PyMC model context
     """
-    x0, P0, c, d, T, Z, R, H, Q = unpack_symbolic_matrices_with_params(mod, param_dict)
+    x0, P0, c, d, T, Z, R, H, Q = unpack_symbolic_matrices_with_params(mod, param_dict, data_dict)
     k_states = mod.k_states
     k_posdef = mod.k_posdef
 
@@ -227,7 +241,7 @@ def simulate_from_numpy_model(mod, rng, param_dict, steps=100):
     y = np.zeros(steps)
 
     x[0] = x0
-    y[0] = Z @ x0
+    y[0] = (Z @ x0).squeeze() if Z.ndim == 2 else (Z[0] @ x0).squeeze()
 
     if not np.allclose(H, 0):
         y[0] += rng.multivariate_normal(mean=np.zeros(1), cov=H)
@@ -245,7 +259,10 @@ def simulate_from_numpy_model(mod, rng, param_dict, steps=100):
             error = 0
 
         x[t] = c + T @ x[t - 1] + innov
-        y[t] = d + Z @ x[t] + error
+        if Z.ndim == 2:
+            y[t] = (d + Z @ x[t] + error).squeeze()
+        else:
+            y[t] = (d + Z[t] @ x[t] + error).squeeze()
 
     return x, y
 
@@ -270,9 +287,7 @@ def make_stationary_params(data, p, d, q, P, D, Q, S):
     sm_sarimax = sm.tsa.SARIMAX(data, order=(p, d, q), seasonal_order=(P, D, Q, S))
     res = sm_sarimax.fit(disp=False)
 
-    param_dict = dict(
-        ar_params=[], ma_params=[], seasonal_ar_params=[], seasonal_ma_params=[], sigma_state=[]
-    )
+    param_dict = dict(ar_params=[], ma_params=[], seasonal_ar_params=[], seasonal_ma_params=[])
 
     for name, param in zip(res.param_names, res.params):
         if name.startswith("ar.S"):
@@ -284,7 +299,11 @@ def make_stationary_params(data, p, d, q, P, D, Q, S):
         elif name.startswith("ma."):
             param_dict["ma_params"].append(param)
         else:
-            param_dict["sigma_state"].append(param)
+            param_dict["sigma_state"] = param
 
-    param_dict = {k: np.array(v, dtype=floatX) for k, v in param_dict.items() if len(v) > 0}
+    param_dict = {
+        k: np.array(v, dtype=floatX)
+        for k, v in param_dict.items()
+        if isinstance(v, float) or len(v) > 0
+    }
     return param_dict

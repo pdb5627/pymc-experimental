@@ -8,7 +8,8 @@ methods in the current release of PyMC experimental.
 .. autosummary::
    :toctree: generated/
 
-   marginal_model.MarginalModel
+   as_model
+   MarginalModel
    model_builder.ModelBuilder
 
 Inference
@@ -28,10 +29,14 @@ Distributions
 .. autosummary::
    :toctree: generated/
 
-   GenExtreme
-   GeneralizedPoisson
+   Chi
+   Maxwell
    DiscreteMarkovChain
+   GeneralizedPoisson
+   BetaNegativeBinomial
+   GenExtreme
    R2D2M2CP
+   Skellam
    histogram_approximation
 
 
@@ -55,3 +60,13 @@ Statespace Models
    statespace/core
    statespace/filters
    statespace/models
+
+
+Model Transforms
+================
+.. automodule:: pymc_experimental.model.transforms
+.. autosummary::
+   :toctree: generated/
+
+   autoreparam.vip_reparametrize
+   autoreparam.VIP

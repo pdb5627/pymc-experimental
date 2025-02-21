@@ -10,6 +10,7 @@ from pymc.logprob.abstract import _logprob
 from pytensor.graph.basic import Node
 
 floatX = pytensor.config.floatX
+COV_ZERO_TOL = 0
 
 lgss_shape_message = (
     "The LinearGaussianStateSpace distribution needs shape information to be constructed. "
@@ -157,8 +158,11 @@ class _LinearGaussianStateSpace(Continuous):
             middle_rng, a_innovation = pm.MvNormal.dist(mu=0, cov=Q, rng=rng).owner.outputs
             next_rng, y_innovation = pm.MvNormal.dist(mu=0, cov=H, rng=middle_rng).owner.outputs
 
-            a_next = c + T @ a + R @ a_innovation
-            y_next = d + Z @ a_next + y_innovation
+            a_mu = c + T @ a
+            a_next = pt.switch(pt.all(pt.le(Q, COV_ZERO_TOL)), a_mu, a_mu + R @ a_innovation)
+
+            y_mu = d + Z @ a_next
+            y_next = pt.switch(pt.all(pt.le(H, COV_ZERO_TOL)), y_mu, y_mu + y_innovation)
 
             next_state = pt.concatenate([a_next, y_next], axis=0)
 
@@ -168,7 +172,11 @@ class _LinearGaussianStateSpace(Continuous):
         Z_init = Z_ if Z_ in non_sequences else Z_[0]
         H_init = H_ if H_ in non_sequences else H_[0]
 
-        init_y_ = pm.MvNormal.dist(Z_init @ init_x_, H_init, rng=rng)
+        init_y_ = pt.switch(
+            pt.all(pt.le(H_init, COV_ZERO_TOL)),
+            Z_init @ init_x_,
+            pm.MvNormal.dist(Z_init @ init_x_, H_init, rng=rng),
+        )
         init_dist_ = pt.concatenate([init_x_, init_y_], axis=0)
 
         statespace, updates = pytensor.scan(
@@ -216,6 +224,7 @@ class LinearGaussianStateSpace(Continuous):
         steps=None,
         mode=None,
         sequence_names=None,
+        k_endog=None,
         **kwargs,
     ):
         dims = kwargs.pop("dims", None)
@@ -239,11 +248,29 @@ class LinearGaussianStateSpace(Continuous):
             sequence_names=sequence_names,
             **kwargs,
         )
-
         k_states = T.type.shape[0]
 
-        latent_states = latent_obs_combined[..., :k_states]
-        obs_states = latent_obs_combined[..., k_states:]
+        if k_endog is None and k_states is None:
+            raise ValueError("Could not infer number of observed states, explicitly pass k_endog.")
+        if k_endog is not None and k_states is not None:
+            total_shape = latent_obs_combined.type.shape[-1]
+            inferred_endog = total_shape - k_states
+            if inferred_endog != k_endog:
+                raise ValueError(
+                    f"Inferred k_endog does not agree with provided value ({inferred_endog} != {k_endog}). "
+                    f"It is not necessary to provide k_endog when the value can be inferred."
+                )
+            latent_slice = slice(None, -k_endog)
+            obs_slice = slice(-k_endog, None)
+        elif k_endog is None:
+            latent_slice = slice(None, k_states)
+            obs_slice = slice(k_states, None)
+        else:
+            latent_slice = slice(None, -k_endog)
+            obs_slice = slice(-k_endog, None)
+
+        latent_states = latent_obs_combined[..., latent_slice]
+        obs_states = latent_obs_combined[..., obs_slice]
 
         latent_states = pm.Deterministic(f"{name}_latent", latent_states, dims=latent_dims)
         obs_states = pm.Deterministic(f"{name}_observed", obs_states, dims=obs_dims)
@@ -263,16 +290,16 @@ class LinearGaussianStateSpace(Continuous):
         return latent_states, obs_states
 
 
-class SequenceMvNormalRV(SymbolicRandomVariable):
+class KalmanFilterRV(SymbolicRandomVariable):
     default_output = 1
-    _print_name = ("SequenceMvNormal", "\\operatorname{SequenceMvNormal}")
+    _print_name = ("KalmanFilter", "\\operatorname{KalmanFilter}")
 
     def update(self, node: Node):
         return {node.inputs[-1]: node.outputs[0]}
 
 
 class SequenceMvNormal(Continuous):
-    rv_op = SequenceMvNormalRV
+    rv_op = KalmanFilterRV
 
     def __new__(cls, *args, **kwargs):
         support_shape = get_support_shape(
@@ -309,6 +336,7 @@ class SequenceMvNormal(Continuous):
         else:
             batch_size = support_shape
 
+        # mus_, covs_ = mus.type(), covs.type()
         mus_, covs_, support_shape_ = mus.type(), covs.type(), support_shape.type()
         steps_ = steps.type()
         logp_ = logp.type()
@@ -325,7 +353,7 @@ class SequenceMvNormal(Continuous):
 
         (seq_mvn_rng,) = tuple(updates.values())
 
-        mvn_seq_op = SequenceMvNormalRV(
+        mvn_seq_op = KalmanFilterRV(
             inputs=[mus_, covs_, logp_, steps_], outputs=[seq_mvn_rng, mvn_seq], ndim_supp=2
         )
 
@@ -333,7 +361,7 @@ class SequenceMvNormal(Continuous):
         return mvn_seq
 
 
-@_logprob.register(SequenceMvNormalRV)
+@_logprob.register(KalmanFilterRV)
 def sequence_mvnormal_logp(op, values, mus, covs, logp, steps, rng, **kwargs):
     return check_parameters(
         logp,

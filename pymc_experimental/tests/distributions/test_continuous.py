@@ -11,13 +11,10 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
-import platform
-
 import numpy as np
 import pymc as pm
 
 # general imports
-import pytensor
 import pytest
 import scipy.stats.distributions as sp
 
@@ -26,6 +23,7 @@ from pymc.testing import (
     BaseTestDistributionRandom,
     Domain,
     R,
+    Rplus,
     Rplusbig,
     assert_moment_is_expected,
     check_logcdf,
@@ -35,7 +33,7 @@ from pymc.testing import (
 )
 
 # the distributions to be tested
-from pymc_experimental.distributions import GenExtreme
+from pymc_experimental.distributions import Chi, GenExtreme, Maxwell
 
 
 class TestGenExtremeClass:
@@ -46,10 +44,6 @@ class TestGenExtremeClass:
     pm.logp(GenExtreme.dist(mu=0.,sigma=1.,xi=0.5),value=-0.01)
     """
 
-    @pytest.mark.xfail(
-        condition=(pytensor.config.floatX == "float32"),
-        reason="PyMC underflows earlier than scipy on float32",
-    )
     def test_logp(self):
         def ref_logp(value, mu, sigma, xi):
             if 1 + xi * (value - mu) / sigma > 0:
@@ -68,13 +62,6 @@ class TestGenExtremeClass:
             ref_logp,
         )
 
-        if pytensor.config.floatX == "float32":
-            raise Exception("Flaky test: It passed this time, but XPASS is not allowed.")
-
-    @pytest.mark.skipif(
-        (pytensor.config.floatX == "float32" and platform.system() == "Windows"),
-        reason="Scipy gives different results on Windows and does not match with desired accuracy",
-    )
     def test_logcdf(self):
         def ref_logcdf(value, mu, sigma, xi):
             if 1 + xi * (value - mu) / sigma > 0:
@@ -149,3 +136,49 @@ class TestGenExtreme(BaseTestDistributionRandom):
         "check_pymc_draws_match_reference",
         "check_rv_size",
     ]
+
+
+class TestChiClass:
+    """
+    Wrapper class so that tests of experimental additions can be dropped into
+    PyMC directly on adoption.
+    """
+
+    def test_logp(self):
+        check_logp(
+            Chi,
+            Rplus,
+            {"nu": Rplus},
+            lambda value, nu: sp.chi.logpdf(value, df=nu),
+        )
+
+    def test_logcdf(self):
+        check_logcdf(
+            Chi,
+            Rplus,
+            {"nu": Rplus},
+            lambda value, nu: sp.chi.logcdf(value, df=nu),
+        )
+
+
+class TestMaxwell:
+    """
+    Wrapper class so that tests of experimental additions can be dropped into
+    PyMC directly on adoption.
+    """
+
+    def test_logp(self):
+        check_logp(
+            Maxwell,
+            Rplus,
+            {"a": Rplus},
+            lambda value, a: sp.maxwell.logpdf(value, scale=a),
+        )
+
+    def test_logcdf(self):
+        check_logcdf(
+            Maxwell,
+            Rplus,
+            {"a": Rplus},
+            lambda value, a: sp.maxwell.logcdf(value, scale=a),
+        )

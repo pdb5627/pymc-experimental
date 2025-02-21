@@ -2,26 +2,33 @@ import warnings
 from typing import Sequence, Tuple, Union
 
 import numpy as np
+import pymc
 import pytensor.tensor as pt
+from arviz import dict_to_dataset
 from pymc import SymbolicRandomVariable
+from pymc.backends.arviz import coords_and_dims_for_inferencedata
 from pymc.distributions.discrete import Bernoulli, Categorical, DiscreteUniform
 from pymc.distributions.transforms import Chain
 from pymc.logprob.abstract import _logprob
-from pymc.logprob.basic import conditional_logp
+from pymc.logprob.basic import conditional_logp, logp
 from pymc.logprob.transforms import IntervalTransform
 from pymc.model import Model
-from pymc.pytensorf import constant_fold, inputvars
-from pytensor import Mode
+from pymc.pytensorf import compile_pymc, constant_fold, inputvars
+from pymc.util import _get_seeds_per_chain, dataset_to_point_list, treedict
+from pytensor import Mode, scan
 from pytensor.compile import SharedVariable
 from pytensor.compile.builders import OpFromGraph
 from pytensor.graph import Constant, FunctionGraph, ancestors, clone_replace
+from pytensor.graph.replace import vectorize_graph
 from pytensor.scan import map as scan_map
-from pytensor.tensor import TensorVariable
+from pytensor.tensor import TensorType, TensorVariable
 from pytensor.tensor.elemwise import Elemwise
+from pytensor.tensor.shape import Shape
+from pytensor.tensor.special import log_softmax
 
 __all__ = ["MarginalModel"]
 
-from pytensor.tensor.shape import Shape
+from pymc_experimental.distributions import DiscreteMarkovChain
 
 
 class MarginalModel(Model):
@@ -74,6 +81,7 @@ class MarginalModel(Model):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.marginalized_rvs = []
+        self._marginalized_named_vars_to_dims = {}
 
     def _delete_rv_mappings(self, rv: TensorVariable) -> None:
         """Remove all model mappings referring to rv
@@ -201,12 +209,15 @@ class MarginalModel(Model):
         return m._logp(vars=vars, **kwargs)
 
     def clone(self):
-        m = MarginalModel()
-        vars = self.basic_RVs + self.potentials + self.deterministics + self.marginalized_rvs
+        m = MarginalModel(coords=self.coords)
+        model_vars = self.basic_RVs + self.potentials + self.deterministics + self.marginalized_rvs
+        data_vars = [var for name, var in self.named_vars.items() if var not in model_vars]
+        vars = model_vars + data_vars
         cloned_vars = clone_replace(vars)
         vars_to_clone = {var: cloned_var for var, cloned_var in zip(vars, cloned_vars)}
+        m.vars_to_clone = vars_to_clone
 
-        m.named_vars = {name: vars_to_clone[var] for name, var in self.named_vars.items()}
+        m.named_vars = treedict({name: vars_to_clone[var] for name, var in self.named_vars.items()})
         m.named_vars_to_dims = self.named_vars_to_dims
         m.values_to_rvs = {i: vars_to_clone[rv] for i, rv in self.values_to_rvs.items()}
         m.rvs_to_values = {vars_to_clone[rv]: i for rv, i in self.rvs_to_values.items()}
@@ -220,29 +231,263 @@ class MarginalModel(Model):
         m.deterministics = [vars_to_clone[det] for det in self.deterministics]
 
         m.marginalized_rvs = [vars_to_clone[rv] for rv in self.marginalized_rvs]
+        m._marginalized_named_vars_to_dims = self._marginalized_named_vars_to_dims
         return m
 
-    def marginalize(self, rvs_to_marginalize: Union[TensorVariable, Sequence[TensorVariable]]):
+    def marginalize(
+        self,
+        rvs_to_marginalize: Union[TensorVariable, str, Sequence[TensorVariable], Sequence[str]],
+    ):
         if not isinstance(rvs_to_marginalize, Sequence):
             rvs_to_marginalize = (rvs_to_marginalize,)
+        rvs_to_marginalize = [
+            self[var] if isinstance(var, str) else var for var in rvs_to_marginalize
+        ]
 
-        supported_dists = (Bernoulli, Categorical, DiscreteUniform)
         for rv_to_marginalize in rvs_to_marginalize:
             if rv_to_marginalize not in self.free_RVs:
                 raise ValueError(
                     f"Marginalized RV {rv_to_marginalize} is not a free RV in the model"
                 )
-            if not isinstance(rv_to_marginalize.owner.op, supported_dists):
+
+            rv_op = rv_to_marginalize.owner.op
+            if isinstance(rv_op, DiscreteMarkovChain):
+                if rv_op.n_lags > 1:
+                    raise NotImplementedError(
+                        "Marginalization for DiscreteMarkovChain with n_lags > 1 is not supported"
+                    )
+                if rv_to_marginalize.owner.inputs[0].type.ndim > 2:
+                    raise NotImplementedError(
+                        "Marginalization for DiscreteMarkovChain with non-matrix transition probability is not supported"
+                    )
+            elif not isinstance(rv_op, (Bernoulli, Categorical, DiscreteUniform)):
                 raise NotImplementedError(
-                    f"RV with distribution {rv_to_marginalize.owner.op} cannot be marginalized. "
-                    f"Supported distribution include {supported_dists}"
+                    f"Marginalization of RV with distribution {rv_to_marginalize.owner.op} is not supported"
                 )
+
+            if rv_to_marginalize.name in self.named_vars_to_dims:
+                dims = self.named_vars_to_dims[rv_to_marginalize.name]
+                self._marginalized_named_vars_to_dims[rv_to_marginalize.name] = dims
 
             self._delete_rv_mappings(rv_to_marginalize)
             self.marginalized_rvs.append(rv_to_marginalize)
 
         # Raise errors and warnings immediately
         self.clone()._marginalize(user_warnings=True)
+
+    def _to_transformed(self):
+        "Create a function from the untransformed space to the transformed space"
+        transformed_rvs = []
+        transformed_names = []
+
+        for rv in self.free_RVs:
+            transform = self.rvs_to_transforms.get(rv)
+            if transform is None:
+                transformed_rvs.append(rv)
+                transformed_names.append(rv.name)
+            else:
+                transformed_rv = transform.forward(rv, *rv.owner.inputs)
+                transformed_rvs.append(transformed_rv)
+                transformed_names.append(self.rvs_to_values[rv].name)
+
+        fn = self.compile_fn(inputs=self.free_RVs, outs=transformed_rvs)
+        return fn, transformed_names
+
+    def unmarginalize(self, rvs_to_unmarginalize):
+        for rv in rvs_to_unmarginalize:
+            self.marginalized_rvs.remove(rv)
+            if rv.name in self._marginalized_named_vars_to_dims:
+                dims = self._marginalized_named_vars_to_dims.pop(rv.name)
+            else:
+                dims = None
+            self.register_rv(rv, name=rv.name, dims=dims)
+
+    def recover_marginals(
+        self,
+        idata,
+        var_names=None,
+        return_samples=True,
+        extend_inferencedata=True,
+        random_seed=None,
+    ):
+        """Computes posterior log-probabilities and samples of marginalized variables
+        conditioned on parameters of the model given InferenceData with posterior group
+
+        When there are multiple marginalized variables, each marginalized variable is
+        conditioned on both the parameters and the other variables still marginalized
+
+        All log-probabilities are within the transformed space
+
+        Parameters
+        ----------
+        idata : InferenceData
+            InferenceData with posterior group
+        var_names : sequence of str, optional
+            List of variable names for which to compute posterior log-probabilities and samples. Defaults to all marginalized variables
+        return_samples : bool, default True
+            If True, also return samples of the marginalized variables
+        extend_inferencedata : bool, default True
+            Whether to extend the original InferenceData or return a new one
+        random_seed: int, array-like of int or SeedSequence, optional
+            Seed used to generating samples
+
+        Returns
+        -------
+        idata : InferenceData
+            InferenceData with where a lp_{varname} and {varname} for each marginalized variable in var_names added to the posterior group
+
+        .. code-block:: python
+
+            import pymc as pm
+            from pymc_experimental import MarginalModel
+
+            with MarginalModel() as m:
+                p = pm.Beta("p", 1, 1)
+                x = pm.Bernoulli("x", p=p, shape=(3,))
+                y = pm.Normal("y", pm.math.switch(x, -10, 10), observed=[10, 10, -10])
+
+                m.marginalize([x])
+
+                idata = pm.sample()
+                m.recover_marginals(idata, var_names=["x"])
+
+
+        """
+        if var_names is None:
+            var_names = [var.name for var in self.marginalized_rvs]
+
+        var_names = [var if isinstance(var, str) else var.name for var in var_names]
+        vars_to_recover = [v for v in self.marginalized_rvs if v.name in var_names]
+        missing_names = [v.name for v in vars_to_recover if v not in self.marginalized_rvs]
+        if missing_names:
+            raise ValueError(f"Unrecognized var_names: {missing_names}")
+
+        if return_samples and random_seed is not None:
+            seeds = _get_seeds_per_chain(random_seed, len(vars_to_recover))
+        else:
+            seeds = [None] * len(vars_to_recover)
+
+        posterior = idata.posterior
+
+        # Remove Deterministics
+        posterior_values = posterior[
+            [rv.name for rv in self.free_RVs if rv not in self.marginalized_rvs]
+        ]
+
+        sample_dims = ("chain", "draw")
+        posterior_pts, stacked_dims = dataset_to_point_list(posterior_values, sample_dims)
+
+        # Handle Transforms
+        transform_fn, transform_names = self._to_transformed()
+
+        def transform_input(inputs):
+            return dict(zip(transform_names, transform_fn(inputs)))
+
+        posterior_pts = [transform_input(vs) for vs in posterior_pts]
+
+        rv_dict = {}
+        rv_dims = {}
+        for seed, marginalized_rv in zip(seeds, vars_to_recover):
+            supported_dists = (Bernoulli, Categorical, DiscreteUniform)
+            if not isinstance(marginalized_rv.owner.op, supported_dists):
+                raise NotImplementedError(
+                    f"RV with distribution {marginalized_rv.owner.op} cannot be recovered. "
+                    f"Supported distribution include {supported_dists}"
+                )
+
+            m = self.clone()
+            marginalized_rv = m.vars_to_clone[marginalized_rv]
+            m.unmarginalize([marginalized_rv])
+            dependent_vars = find_conditional_dependent_rvs(marginalized_rv, m.basic_RVs)
+            joint_logps = m.logp(vars=[marginalized_rv] + dependent_vars, sum=False)
+
+            marginalized_value = m.rvs_to_values[marginalized_rv]
+            other_values = [v for v in m.value_vars if v is not marginalized_value]
+
+            # Handle batch dims for marginalized value and its dependent RVs
+            marginalized_logp, *dependent_logps = joint_logps
+            joint_logp = marginalized_logp + _add_reduce_batch_dependent_logps(
+                marginalized_rv.type, dependent_logps
+            )
+
+            rv_shape = constant_fold(tuple(marginalized_rv.shape))
+            rv_domain = get_domain_of_finite_discrete_rv(marginalized_rv)
+            rv_domain_tensor = pt.moveaxis(
+                pt.full(
+                    (*rv_shape, len(rv_domain)),
+                    rv_domain,
+                    dtype=marginalized_rv.dtype,
+                ),
+                -1,
+                0,
+            )
+
+            joint_logps = vectorize_graph(
+                joint_logp,
+                replace={marginalized_value: rv_domain_tensor},
+            )
+            joint_logps = pt.moveaxis(joint_logps, 0, -1)
+
+            rv_loglike_fn = None
+            joint_logps_norm = log_softmax(joint_logps, axis=-1)
+            if return_samples:
+                sample_rv_outs = pymc.Categorical.dist(logit_p=joint_logps)
+                if isinstance(marginalized_rv.owner.op, DiscreteUniform):
+                    sample_rv_outs += rv_domain[0]
+
+                rv_loglike_fn = compile_pymc(
+                    inputs=other_values,
+                    outputs=[joint_logps_norm, sample_rv_outs],
+                    on_unused_input="ignore",
+                    random_seed=seed,
+                )
+            else:
+                rv_loglike_fn = compile_pymc(
+                    inputs=other_values,
+                    outputs=joint_logps_norm,
+                    on_unused_input="ignore",
+                    random_seed=seed,
+                )
+
+            logvs = [rv_loglike_fn(**vs) for vs in posterior_pts]
+
+            logps = None
+            samples = None
+            if return_samples:
+                logps, samples = zip(*logvs)
+                logps = np.array(logps)
+                samples = np.array(samples)
+                rv_dict[marginalized_rv.name] = samples.reshape(
+                    tuple(len(coord) for coord in stacked_dims.values()) + samples.shape[1:],
+                )
+            else:
+                logps = np.array(logvs)
+
+            rv_dict["lp_" + marginalized_rv.name] = logps.reshape(
+                tuple(len(coord) for coord in stacked_dims.values()) + logps.shape[1:],
+            )
+            if marginalized_rv.name in m.named_vars_to_dims:
+                rv_dims[marginalized_rv.name] = list(m.named_vars_to_dims[marginalized_rv.name])
+                rv_dims["lp_" + marginalized_rv.name] = rv_dims[marginalized_rv.name] + [
+                    "lp_" + marginalized_rv.name + "_dim"
+                ]
+
+        coords, dims = coords_and_dims_for_inferencedata(self)
+        dims.update(rv_dims)
+        rv_dataset = dict_to_dataset(
+            rv_dict,
+            library=pymc,
+            dims=dims,
+            coords=coords,
+            default_dims=list(sample_dims),
+            skip_event_dims=True,
+        )
+
+        if extend_inferencedata:
+            idata.posterior = idata.posterior.assign(rv_dataset)
+            return idata
+        else:
+            return rv_dataset
 
 
 class MarginalRV(SymbolicRandomVariable):
@@ -251,6 +496,10 @@ class MarginalRV(SymbolicRandomVariable):
 
 class FiniteDiscreteMarginalRV(MarginalRV):
     """Base class for Finite Discrete Marginalized RVs"""
+
+
+class DiscreteMarginalMarkovChainRV(MarginalRV):
+    """Base class for Discrete Marginal Markov Chain RVs"""
 
 
 def static_shape_ancestors(vars):
@@ -340,10 +589,13 @@ def replace_finite_discrete_marginal_subgraph(fgraph, rv_to_marginalize, all_rvs
         raise ValueError(f"No RVs depend on marginalized RV {rv_to_marginalize}")
 
     ndim_supp = {rv.owner.op.ndim_supp for rv in dependent_rvs}
-    if max(ndim_supp) > 0:
+    if len(ndim_supp) != 1:
         raise NotImplementedError(
-            "Marginalization of withe dependent Multivariate RVs not implemented"
+            "Marginalization with dependent variables of different support dimensionality not implemented"
         )
+    [ndim_supp] = ndim_supp
+    if ndim_supp > 0:
+        raise NotImplementedError("Marginalization with dependent Multivariate RVs not implemented")
 
     marginalized_rv_input_rvs = find_conditional_input_rvs([rv_to_marginalize], all_rvs)
     dependent_rvs_input_rvs = [
@@ -358,7 +610,7 @@ def replace_finite_discrete_marginal_subgraph(fgraph, rv_to_marginalize, all_rvs
     # can ultimately be generated that is proportional to the support domain and not
     # to the variables dimensions
     # We don't need to worry about this if the  RV is scalar.
-    if np.prod(constant_fold(tuple(rv_to_marginalize.shape))) > 1:
+    if np.prod(constant_fold(tuple(rv_to_marginalize.shape), raise_not_constant=False)) != 1:
         if not is_elemwise_subgraph(rv_to_marginalize, dependent_rvs_input_rvs, dependent_rvs):
             raise NotImplementedError(
                 "The subgraph between a marginalized RV and its dependents includes non Elemwise operations. "
@@ -378,11 +630,17 @@ def replace_finite_discrete_marginal_subgraph(fgraph, rv_to_marginalize, all_rvs
     replace_inputs.update({input_rv: input_rv.type() for input_rv in input_rvs})
     cloned_outputs = clone_replace(outputs, replace=replace_inputs)
 
-    marginalization_op = FiniteDiscreteMarginalRV(
+    if isinstance(rv_to_marginalize.owner.op, DiscreteMarkovChain):
+        marginalize_constructor = DiscreteMarginalMarkovChainRV
+    else:
+        marginalize_constructor = FiniteDiscreteMarginalRV
+
+    marginalization_op = marginalize_constructor(
         inputs=list(replace_inputs.values()),
         outputs=cloned_outputs,
-        ndim_supp=0,
+        ndim_supp=ndim_supp,
     )
+
     marginalized_rvs = marginalization_op(*replace_inputs.keys())
     fgraph.replace_all(tuple(zip(rvs_to_marginalize, marginalized_rvs)))
     return rvs_to_marginalize, marginalized_rvs
@@ -398,8 +656,27 @@ def get_domain_of_finite_discrete_rv(rv: TensorVariable) -> Tuple[int, ...]:
     elif isinstance(op, DiscreteUniform):
         lower, upper = constant_fold(rv.owner.inputs[3:])
         return tuple(range(lower, upper + 1))
+    elif isinstance(op, DiscreteMarkovChain):
+        P = rv.owner.inputs[0]
+        return tuple(range(pt.get_vector_length(P[-1])))
 
     raise NotImplementedError(f"Cannot compute domain for op {op}")
+
+
+def _add_reduce_batch_dependent_logps(
+    marginalized_type: TensorType, dependent_logps: Sequence[TensorVariable]
+):
+    """Add the logps of dependent RVs while reducing extra batch dims relative to `marginalized_type`."""
+
+    mbcast = marginalized_type.broadcastable
+    reduced_logps = []
+    for dependent_logp in dependent_logps:
+        dbcast = dependent_logp.type.broadcastable
+        dim_diff = len(dbcast) - len(mbcast)
+        mbcast_aligned = (True,) * dim_diff + mbcast
+        vbcast_axis = [i for i, (m, v) in enumerate(zip(mbcast_aligned, dbcast)) if m and not v]
+        reduced_logps.append(dependent_logp.sum(vbcast_axis))
+    return pt.add(*reduced_logps)
 
 
 @_logprob.register(FiniteDiscreteMarginalRV)
@@ -417,17 +694,12 @@ def finite_discrete_marginal_rv_logp(op, values, *inputs, **kwargs):
     logps_dict = conditional_logp(rv_values=inner_rvs_to_values, **kwargs)
 
     # Reduce logp dimensions corresponding to broadcasted variables
-    joint_logp = logps_dict[inner_rvs_to_values[marginalized_rv]]
-    for inner_rv, inner_value in inner_rvs_to_values.items():
-        if inner_rv is marginalized_rv:
-            continue
-        vbcast = inner_value.type.broadcastable
-        mbcast = marginalized_rv.type.broadcastable
-        mbcast = (True,) * (len(vbcast) - len(mbcast)) + mbcast
-        values_axis_bcast = [i for i, (m, v) in enumerate(zip(mbcast, vbcast)) if m != v]
-        joint_logp += logps_dict[inner_value].sum(values_axis_bcast, keepdims=True)
+    marginalized_logp = logps_dict.pop(inner_rvs_to_values[marginalized_rv])
+    joint_logp = marginalized_logp + _add_reduce_batch_dependent_logps(
+        marginalized_rv.type, logps_dict.values()
+    )
 
-    # Wrap the joint_logp graph in an OpFromGrah, so that we can evaluate it at different
+    # Wrap the joint_logp graph in an OpFromGraph, so that we can evaluate it at different
     # values of the marginalized RV
     # Some inputs are not root inputs (such as transformed projections of value variables)
     # Or cannot be used as inputs to an OpFromGraph (shared variables and constants)
@@ -442,27 +714,26 @@ def finite_discrete_marginal_rv_logp(op, values, *inputs, **kwargs):
     # batched dimensions of the marginalized RV
 
     # PyMC does not allow RVs in the logp graph, even if we are just using the shape
-    marginalized_rv_shape = constant_fold(tuple(marginalized_rv.shape))
+    marginalized_rv_shape = constant_fold(tuple(marginalized_rv.shape), raise_not_constant=False)
     marginalized_rv_domain = get_domain_of_finite_discrete_rv(marginalized_rv)
-    marginalized_rv_domain_tensor = pt.swapaxes(
+    marginalized_rv_domain_tensor = pt.moveaxis(
         pt.full(
             (*marginalized_rv_shape, len(marginalized_rv_domain)),
             marginalized_rv_domain,
             dtype=marginalized_rv.dtype,
         ),
-        axis1=0,
-        axis2=-1,
+        -1,
+        0,
     )
 
     # Arbitrary cutoff to switch to Scan implementation to keep graph size under control
+    # TODO: Try vectorize here
     if len(marginalized_rv_domain) <= 10:
         joint_logps = [
             joint_logp_op(marginalized_rv_domain_tensor[i], *values, *inputs)
             for i in range(len(marginalized_rv_domain))
         ]
     else:
-        # Make sure this rewrite is registered
-        from pymc.pytensorf import local_remove_check_parameter
 
         def logp_fn(marginalized_rv_const, *non_sequences):
             return joint_logp_op(marginalized_rv_const, *non_sequences)
@@ -478,3 +749,69 @@ def finite_discrete_marginal_rv_logp(op, values, *inputs, **kwargs):
 
     # We have to add dummy logps for the remaining value variables, otherwise PyMC will raise
     return joint_logps, *(pt.constant(0),) * (len(values) - 1)
+
+
+@_logprob.register(DiscreteMarginalMarkovChainRV)
+def marginal_hmm_logp(op, values, *inputs, **kwargs):
+
+    marginalized_rvs_node = op.make_node(*inputs)
+    inner_rvs = clone_replace(
+        op.inner_outputs,
+        replace={u: v for u, v in zip(op.inner_inputs, marginalized_rvs_node.inputs)},
+    )
+
+    chain_rv, *dependent_rvs = inner_rvs
+    P, n_steps_, init_dist_, rng = chain_rv.owner.inputs
+    domain = pt.arange(P.shape[-1], dtype="int32")
+
+    # Construct logp in two steps
+    # Step 1: Compute the probability of the data ("emissions") under every possible state (vec_logp_emission)
+
+    # First we need to vectorize the conditional logp graph of the data, in case there are batch dimensions floating
+    # around. To do this, we need to break the dependency between chain and the init_dist_ random variable. Otherwise,
+    # PyMC will detect a random variable in the logp graph (init_dist_), that isn't relevant at this step.
+    chain_value = chain_rv.clone()
+    dependent_rvs = clone_replace(dependent_rvs, {chain_rv: chain_value})
+    logp_emissions_dict = conditional_logp(dict(zip(dependent_rvs, values)))
+
+    # Reduce and add the batch dims beyond the chain dimension
+    reduced_logp_emissions = _add_reduce_batch_dependent_logps(
+        chain_rv.type, logp_emissions_dict.values()
+    )
+
+    # Add a batch dimension for the domain of the chain
+    chain_shape = constant_fold(tuple(chain_rv.shape))
+    batch_chain_value = pt.moveaxis(pt.full((*chain_shape, domain.size), domain), -1, 0)
+    batch_logp_emissions = vectorize_graph(reduced_logp_emissions, {chain_value: batch_chain_value})
+
+    # Step 2: Compute the transition probabilities
+    # This is the "forward algorithm", alpha_t = p(y | s_t) * sum_{s_{t-1}}(p(s_t | s_{t-1}) * alpha_{t-1})
+    # We do it entirely in logs, though.
+
+    # To compute the prior probabilities of each state, we evaluate the logp of the domain (all possible states) under
+    # the initial distribution. This is robust to everything the user can throw at it.
+    batch_logp_init_dist = pt.vectorize(lambda x: logp(init_dist_, x), "()->()")(
+        batch_chain_value[..., 0]
+    )
+    log_alpha_init = batch_logp_init_dist + batch_logp_emissions[..., 0]
+
+    def step_alpha(logp_emission, log_alpha, log_P):
+        step_log_prob = pt.logsumexp(log_alpha[:, None] + log_P, axis=0)
+        return logp_emission + step_log_prob
+
+    P_bcast_dims = (len(chain_shape) - 1) - (P.type.ndim - 2)
+    log_P = pt.shape_padright(pt.log(P), P_bcast_dims)
+    log_alpha_seq, _ = scan(
+        step_alpha,
+        non_sequences=[log_P],
+        outputs_info=[log_alpha_init],
+        # Scan needs the time dimension first, and we already consumed the 1st logp computing the initial value
+        sequences=pt.moveaxis(batch_logp_emissions[..., 1:], -1, 0),
+    )
+    # Final logp is just the sum of the last scan state
+    joint_logp = pt.logsumexp(log_alpha_seq[-1], axis=0)
+
+    # If there are multiple emission streams, we have to add dummy logps for the remaining value variables. The first
+    # return is the joint probability of everything together, but PyMC still expects one logp for each one.
+    dummy_logps = (pt.constant(0),) * (len(values) - 1)
+    return joint_logp, *dummy_logps
