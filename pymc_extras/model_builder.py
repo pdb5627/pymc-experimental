@@ -522,7 +522,7 @@ class ModelBuilder:
             predictor_names = []
         if y is None:
             y = np.zeros(X.shape[0])
-            y = pd.Series(y, name=self.output_var)
+        y = pd.Series(y, name=self.output_var)
         self._generate_and_preprocess_model_data(X, y)
         self.build_model(X, y)
 
@@ -724,12 +724,14 @@ class ModelBuilder:
         """
         self._data_setter(X_pred)
 
-        with self.model:  # sample with new input data
-            post_pred = pm.sample_posterior_predictive(self.idata, predictions=True, **kwargs)
+        with self.model:  # sample with new input data, predictions=True
+            post_pred = pm.sample_posterior_predictive(self.idata, **kwargs)
             if extend_idata:
                 self.idata.extend(post_pred, join="right")
 
-        posterior_predictive_samples = az.extract(post_pred, "predictions", combined=combined)
+        posterior_predictive_samples = az.extract(
+            post_pred, "posterior_predictive", combined=combined
+        )
 
         return posterior_predictive_samples
 

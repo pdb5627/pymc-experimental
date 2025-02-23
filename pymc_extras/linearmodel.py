@@ -161,5 +161,5 @@ class LinearModel(ModelBuilder):
         >>> assert y.shape == (100,)
         """
         # Ensure output Series is named appropriately
-        y = y.rename(self.output_var)
+        # y = y.rename(self.output_var)
         self.X, self.y = X, y
